@@ -1,0 +1,36 @@
+PASS  chip renders exactly one glyph
+PASS  glyph uses the prefixed codicon class
+PASS  chip text is the savings percentage
+PASS  chip drops the token remainder
+PASS  chip drops the inline scale
+PASS  chip keeps the statusbar hover chrome
+PASS  chip numerals are tabular
+PASS  chip is one button, not nested
+PASS  tooltip names plugin, rate and state
+PASS  accessible name equals the tooltip
+PASS  panel names the plugin
+PASS  panel shows the version
+PASS  panel leads with the percentage
+PASS  panel carries the money behind it
+PASS  panel names the baseline
+PASS  panel states this chat
+PASS  panel shows the context reading with units
+PASS  panel names both reference points under the scale
+PASS  the two scale captions are separate lines
+PASS  panel draws the scale bar once
+PASS  panel breaks the ledger down
+PASS  panel glosses the word wasted
+PASS  panel dates the last compaction unambiguously
+PASS  panel opens above the chip
+PASS  panel is anchored to the chip end
+PASS  panel is a popover surface
+PASS  panel label column is fixed
+PASS  no banned words
+PASS  no ledger: chip is the glyph alone
+PASS  no ledger: panel explains in words
+PASS  no ledger: no invented percentage
+PASS  no ledger: tooltip stays honest
+PASS  no baseline: chip falls back to the glyph
+PASS  no baseline: panel still shows the money
+PASS  open chip stays lit
+PASS  open chip keeps its glyph and rate
