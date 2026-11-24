@@ -17,13 +17,53 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import ssl
-import urllib.error
-import urllib.request
+from pathlib import Path
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
-TIMEOUT = 300.0
+_UA_CACHE: str | None = None
+_SSL_CTX = None
+
+
+def _ssl_context():
+    """Системное хранилище сертификатов — одно на процесс.
+
+    `ssl.create_default_context()` на Windows перечисляет хранилище при каждом
+    вызове; warm-запросов мало, но контекст всё равно нет смысла пересоздавать.
+    """
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        _SSL_CTX = ssl.create_default_context()
+    return _SSL_CTX
+
+
+def _user_agent() -> str:
+    """Честная подпись клиента: ``idle-compact/<версия из plugin.yaml>``.
+
+    Cloudflare перед релеем отбивает ``Python-urllib`` (HTTP 403, error code
+    1010), поэтому подпись обязательна. Но подделываться под чужой клиент
+    нельзя: версия берётся из собственного манифеста и не устаревает вместе
+    с зависимостями.
+    """
+    global _UA_CACHE
+    if _UA_CACHE:
+        return _UA_CACHE
+    version = "0.0.0"
+    # Осознанно regex, а не YAML: второй читатель версии, независимый
+    # от YAML-стека (warm_client грузится отдельно, в т.ч. в тестах).
+    try:
+        text = (Path(__file__).resolve().parent / "plugin.yaml").read_text(encoding="utf-8")
+        m = re.search(r'(?m)^version:\s*["\']?([0-9][^"\'\s]*)', text)
+        if m:
+            version = m.group(1)
+    except Exception:
+        pass
+    _UA_CACHE = f"idle-compact/{version}"
+    return _UA_CACHE
 
 
 class WarmRefused(RuntimeError):
@@ -55,7 +95,7 @@ def _conversation_session_key(
 def _headers(api_key: str, api_mode: str, base_url: str, session_key: str | None = None) -> dict[str, str]:
     h = {
         "Content-Type": "application/json",
-        "User-Agent": "HermesAgent/0.22.5",
+        "User-Agent": _user_agent(),
     }
     if api_mode == "anthropic_messages":
         h["x-api-key"] = api_key
@@ -84,6 +124,12 @@ def _url(base_url: str, api_mode: str) -> str:
 
 def _instruction_row(prompt: str) -> dict:
     return {"role": "user", "content": prompt}
+
+
+# Anthropic требует ``max_tokens`` в теле запроса: без него релей отвечает 400
+# и весь warm-путь падает. Ниже 1500 лимит бессмысленен — reasoning съедает
+# бюджет и текста саммари не остаётся (AGENTS.md, «Транспорты warm-запроса»).
+ANTHROPIC_MIN_MAX_TOKENS = 1500
 
 
 def build_payload(captured: dict, prompt: str, api_mode: str, max_tokens: int | None) -> dict:
@@ -136,18 +182,45 @@ def build_payload(captured: dict, prompt: str, api_mode: str, max_tokens: int | 
     if api_mode == "codex_responses":
         body["input"] = rows
         body.pop("messages", None)
-        body["max_output_tokens"] = int(max_tokens or 4000)
+        if max_tokens:
+            body["max_output_tokens"] = int(max_tokens)
+        else:
+            # Как в ядре: жёсткий лимит вывода обрезает саммари (thinking-модели
+            # тратят его на рассуждение). Лимит не ставим вовсе.
+            body.pop("max_output_tokens", None)
         body["store"] = False
         # stream в /responses не выставляем: с stream=false релей отвечает 403
         body.pop("stream", None)
     elif api_mode == "anthropic_messages":
         body["messages"] = rows
-        body["max_tokens"] = int(max_tokens or 4000)
+        # Обязательное поле: удалять его нельзя, иначе 400 на всём warm-пути.
+        body["max_tokens"] = int(max_tokens) if max_tokens else ANTHROPIC_MIN_MAX_TOKENS
     else:
         body["messages"] = rows
-        body["max_tokens"] = int(max_tokens or 4000)
+        if max_tokens:
+            body["max_tokens"] = int(max_tokens)
+        else:
+            body.pop("max_tokens", None)
         body["stream"] = False
     return body
+
+
+def _truncated(data: dict, api_mode: str) -> bool:
+    """Ответ оборван лимитом вывода? Текст при этом выглядит валидным.
+
+    Ядро на таком ответе падает намеренно: обрезанное саммари потеряет хвост
+    и утащит обрубок во все последующие сжатия.
+    """
+    if api_mode == "codex_responses":
+        status = str(data.get("status") or "")
+        reason = str(((data.get("incomplete_details") or {}).get("reason")) or "")
+        return status == "incomplete" or reason in ("max_output_tokens", "max_tokens")
+    if api_mode == "anthropic_messages":
+        return str(data.get("stop_reason") or "") in ("max_tokens", "length")
+    choices = data.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        return str(choices[0].get("finish_reason") or "") in ("length", "max_tokens")
+    return False
 
 
 def _extract_text(data: dict, api_mode: str) -> str:
@@ -170,21 +243,13 @@ def _extract_text(data: dict, api_mode: str) -> str:
 
 def request_summary(
     *, captured: dict, prompt: str, api_mode: str, base_url: str, api_key: str,
-    max_tokens: int | None = None, session_id: str | None = None,
+    timeout: float, max_tokens: int | None = None, session_id: str | None = None,
     provider: str | None = None,
 ) -> tuple[str, dict]:
     """Выполнить warm-запрос. Возвращает (текст саммари, usage)."""
     body = build_payload(captured, prompt, api_mode, max_tokens)
     url = _url(base_url, api_mode)
     data = json.dumps(body).encode()
-    # Отладочный дамп отправленного warm-тела: без него не видно, почему
-    # провайдер не находит кеш (вход 61k при захваченных 42k).
-    try:
-        from pathlib import Path as _P
-        _dump = _P.home() / ".hermes" / f"idle_warm_body_{api_mode}.json"
-        _dump.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
     session_key = _conversation_session_key(provider, base_url, session_id)
     try:
         logger.info(
@@ -194,20 +259,26 @@ def request_summary(
         )
     except Exception:
         pass
-    req = urllib.request.Request(url, data=data, headers=_headers(api_key, api_mode, base_url, session_key), method="POST")
     try:
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", "replace")[:300]
-        except Exception:
-            pass
-        raise WarmRefused(f"HTTP {exc.code}: {detail}") from exc
+        # httpx, а не urllib: UA ставим свой, таймаут явный (дефолт httpx —
+        # 5 с, живое сжатие длится дольше), доверие сертификатам — системное
+        # хранилище, как раньше. Редиректы не идём: httpx снимает Authorization
+        # на чужой хост, но оставляет x-api-key (режим Anthropic), и релей мог бы
+        # получить ключ пользователя. Ревью: 13.11.2026.
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+            verify=_ssl_context(),
+        ) as client:
+            resp = client.post(url, content=data,
+                               headers=_headers(api_key, api_mode, base_url, session_key))
     except Exception as exc:
         raise WarmRefused(f"{type(exc).__name__}: {exc}") from exc
+    if 300 <= resp.status_code < 400:
+        raise WarmRefused(f"HTTP {resp.status_code}: redirect not followed ({resp.headers.get('location', '')})")
+    if resp.status_code >= 400:
+        raise WarmRefused(f"HTTP {resp.status_code}: {resp.text[:300]}")
+    raw = resp.content
 
     try:
         parsed = json.loads(raw)
@@ -215,6 +286,8 @@ def request_summary(
         raise WarmRefused("не JSON в ответе") from exc
 
     text = _extract_text(parsed, api_mode)
+    if _truncated(parsed, api_mode):
+        raise WarmRefused("саммари оборвано лимитом вывода (finish_reason=length)")
     usage = parsed.get("usage") or {}
     oc = (usage.get("opencode") or {}).get("tokens") or {}
     stats = {
@@ -230,7 +303,7 @@ def request_summary(
 
 def apply_warm(
     *, captured: dict, prompt: str, api_mode: str, base_url: str, api_key: str,
-    max_tokens: int | None = None, session_id: str | None = None,
+    timeout: float, max_tokens: int | None = None, session_id: str | None = None,
     provider: str | None = None,
 ) -> tuple[str, dict]:
     """Проверить применимость и выполнить warm-запрос."""
@@ -242,6 +315,6 @@ def apply_warm(
         raise WarmRefused("нет маршрута или ключа")
     return request_summary(
         captured=captured, prompt=prompt, api_mode=api_mode,
-        base_url=base_url, api_key=api_key, max_tokens=max_tokens,
+        base_url=base_url, api_key=api_key, timeout=timeout, max_tokens=max_tokens,
         session_id=session_id, provider=provider,
     )

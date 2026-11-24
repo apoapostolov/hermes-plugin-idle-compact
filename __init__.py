@@ -2,8 +2,8 @@
 
 Логика:
 - после каждого хода (хук on_session_end) ставим/сбрасываем таймер сессии:
-  delay = TTL(модель) x 0.9 (таблица TTL_BY_MODEL_SUBSTR + замер/дефолт);
-- таймер сработал: сессия всё ещё тиха, источник human, размер > гейта —
+  delay = min(TTL модели, TTL выселения) − 30 с (таблица TTL_BY_MODEL_SUBSTR);
+- таймер сработал: сессия всё ещё тиха, источник не машинный, размер > гейта —
   сжимаем ядром (штатный путь) с warm-суммированием по кешу;
 - гейт = цель x 2, цель = threshold_tokens x target_ratio
   (живой порог компрессора; без него — из config.yaml).
@@ -16,6 +16,7 @@ import logging
 import os
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -60,17 +61,22 @@ WRITE_ENABLED = True      # боевое сжатие включено
 # Пустой = все human-сессии; непустой = только перечисленные (тесты/откат)
 ALLOWLIST: set[str] = set()
 
-# Единственный источник правды о TTL — model_ttl.py (его же читает savings.py).
+# Единственный источник правды о TTL — model_ttl.py (его же читает savings.py),
+# числа политики — policy.py. Здесь литералов времени нет.
 from .model_ttl import DEFAULT_TTL_SECONDS, TTL_BY_MODEL_SUBSTR, ttl_for_model
+from . import policy
 
-TTL_FACTOR = 0.9
+# Модели, для которых уже жаловались на обрезку таймера выселением (один раз за процесс).
+_warned_evict_cap: set[str] = set()
 
 
-def _test_settings() -> dict:
-    """Тестовый режим без правки кода: ~/.hermes/idle_compact_test.json.
+def _test_settings(session_id: str | None = None) -> dict:
+    """Тестовый режим без правки кода: <HERMES_HOME>/idle_compact_test.json.
 
     {"seconds": 300, "gate": 20000} — таймер и гейт для быстрой проверки.
-    Файла нет — обычный режим.
+    Поле "session" ограничивает режим одной сессией (префикс ID):
+    {"seconds": 10, "gate": 150000, "session": "local-c11b24"} — остальные
+    сессии работают штатно. Файла нет — обычный режим.
     """
     try:
         import json
@@ -79,14 +85,47 @@ def _test_settings() -> dict:
         if not path.exists():
             return {}
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        want = str(data.get("session") or "").strip()
+        if want:
+            have = str(session_id or "")
+            if not have or not have.startswith(want):
+                return {}
+        return data
     except Exception:
         logger.debug("idle-compact: test settings read failed", exc_info=True)
         return {}
 GATE_K = 2.0          # сжимаем только если контекст >= 2x цели сжатия
 THRESHOLD_TOKENS = 500_000   # запасной порог, если конфиг нечитаем
 TARGET_RATIO = 0.2           # сверено: tokens_after ~0.2 x threshold
-HUMAN_SOURCES = {"telegram", "desktop", "cli", "tui", "messaging", "local"}
+# Машинные источники сессий: сжимать их в фоне не надо. Всё остальное считаем
+# человеческим — включая платформы, которых ещё нет (перевёрнутая логика:
+# раньше белый список отставал от ядра и молча пропускал gui,
+# discord, slack и др.). Состав сверен с ядром: hermes_state_local_migration
+# (NOT_CLIENT_LABELS), gateway/session_policy (SURFACES), gateway/config
+# (Platform). Кортеж фиксированного порядка — из него же строится SQL.
+MACHINE_SOURCES = (
+    "subagent", "oneshot", "tool", "cron", "kanban", "batch", "curator",
+    "a2a", "api_server", "webhook", "msgraph_webhook", "bot_room",
+    "webui", "import", "recovered", "unknown",
+)
+
+
+def _is_machine_source(source: object) -> bool:
+    """Машинная ли сессия: такие не ставим на таймер и не сжимаем в фоне."""
+    return str(source or "") in MACHINE_SOURCES
+
+
+def _human_filter_sql() -> tuple[str, tuple]:
+    """SQL-фильтр «только человеческие»: параметризованный NOT IN из MACHINE_SOURCES."""
+    if not MACHINE_SOURCES:
+        raise ValueError("MACHINE_SOURCES пуст")
+    placeholders = ",".join(["?"] * len(MACHINE_SOURCES))
+    return (
+        f"AND COALESCE(source,'') NOT IN ({placeholders}) ",
+        tuple(MACHINE_SOURCES),
+    )
 
 _HERMES_HOME_FALLBACK = Path.home() / ".hermes"
 
@@ -111,6 +150,46 @@ def _home() -> Path:
     return _HERMES_HOME_FALLBACK
 
 
+def _yaml_module():
+    """YAML-модуль: сначала ядровый hermes_yaml, потом PyYAML.
+
+    PyYAML не объявлен в зависимостях ядра и держится на чужой транзитивной
+    зависимости, а на Python 3.14 у него вообще нет колеса. hermes_yaml
+    (ядровый фасад над ruamel) есть всегда, раз стоит Hermes. Идея — PR #2
+    от apoapostolov, спасибо.
+    """
+    for _name in ("hermes_yaml", "yaml"):
+        try:
+            mod = __import__(_name)
+            if hasattr(mod, "safe_load"):
+                return mod
+        except Exception:
+            continue
+    raise ImportError("no YAML module with safe_load")
+
+
+def _read_yaml_file(path):
+    """Прочитать YAML-файл в dict. Никогда не бросает: ошибка → None.
+
+    None означает «не прочитали» (нет файла, нет YAML-модуля, битый файл) —
+    это отличается от {} («прочитали, пусто») и позволяет вызывающему
+    честно сказать «конфиг нечитаем», а не считать дефолты молча.
+    """
+    try:
+        yaml = _yaml_module()
+        with open(str(path), "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.debug("idle-compact: yaml read failed for %s", path, exc_info=True)
+        return None
+
+
+def _read_config():
+    """Весь config.yaml как dict. Никогда не бросает: ошибка → None."""
+    return _read_yaml_file(_home() / "config.yaml")
+
+
 def _state_db() -> str:
     return str(_home() / "state.db")
 
@@ -120,19 +199,18 @@ GATE_TOKENS = int(THRESHOLD_TOKENS * TARGET_RATIO * GATE_K)  # = 150000
 _warned_no_config = False
 
 
-def _live_target(window_tokens: int | None = None) -> int | None:
-    """Живая цель из config.yaml. Нет конфига — None (скип, не вшитое).
+def _live_threshold(window_tokens: int | None = None, cfg: dict | None = None) -> int | None:
+    """Порог сжатия ядра в токенах. Нет данных — None.
 
-    Понимает оба вида порога: ``threshold_tokens`` (абсолютные токены) и
-    ``threshold`` (доля окна 0..1). Долю умножаем только на ФАКТИЧЕСКОЕ окно
-    модели (``window_tokens`` из живого компрессора); выдумывать окно нельзя —
-    иначе для модели с окном 200К цель завышается впятеро.
+    Тот же источник, что у цели (доля × фактическое окно / абсолютные
+    токены / дефолт ядра), но без умножения на target_ratio: нужен шкале
+    чипа как правая граница.
     """
-    global _warned_no_config
     try:
-        import yaml
-        with open(str(_home() / "config.yaml"), "r", encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh) or {}
+        if cfg is None:
+            cfg = _read_config()
+        if cfg is None:
+            raise ValueError("config.yaml unreadable")
         comp = cfg.get("compression") or {}
         thr = comp.get("threshold_tokens")
         if thr is None and comp.get("threshold") is not None:
@@ -143,11 +221,41 @@ def _live_target(window_tokens: int | None = None) -> int | None:
                 thr = int(frac * int(window_tokens))
             else:
                 thr = int(frac)
+        if thr is None and window_tokens and window_tokens > 0:
+            # Дефолт ядра: 0.50 окна, пол 0.75 для окон <512К.
+            frac = 0.75 if int(window_tokens) < 512 * 1024 else 0.50
+            thr = int(frac * int(window_tokens))
+        if thr is None:
+            raise ValueError("no compression.threshold_tokens/threshold in config")
+        return int(thr)
+    except Exception:
+        return None
+
+
+def _live_target(window_tokens: int | None = None, cfg: dict | None = None) -> int | None:
+    """Живая цель из config.yaml. Нет конфига — None (скип, не вшитое).
+
+    Понимает оба вида порога: ``threshold_tokens`` (абсолютные токены) и
+    ``threshold`` (доля окна 0..1). Долю умножаем только на ФАКТИЧЕСКОЕ окно
+    модели (``window_tokens`` из живого компрессора); выдумывать окно нельзя —
+    иначе для модели с окном 200К цель завышается впятеро.
+
+    Без секции в конфиге — дефолты ядра (порог 0.50, для окон <512К пол 0.75),
+    чтобы на чистой установке плагин работал, а не молчал.
+    """
+    global _warned_no_config
+    try:
+        if cfg is None:
+            cfg = _read_config()
+        if cfg is None:
+            raise ValueError("config.yaml unreadable")
+        thr = _live_threshold(window_tokens, cfg)
+        if thr is None:
+            raise ValueError("no compression.threshold_tokens/threshold in config")
+        comp = cfg.get("compression") or {}
         ratio = comp.get("target_ratio")
         if ratio is None:
             ratio = TARGET_RATIO
-        if thr is None:
-            raise ValueError("no compression.threshold_tokens/threshold in config")
         return int(int(thr) * float(ratio))
     except Exception as exc:
         if not _warned_no_config:
@@ -156,26 +264,56 @@ def _live_target(window_tokens: int | None = None) -> int | None:
         return None
 
 
-def _plugin_cfg() -> dict:
+def _plugin_cfg(cfg: dict | None = None) -> dict:
     """Секция plugins.idle_compact из config.yaml (или пустой словарь)."""
     try:
-        import yaml
-        with open(str(_home() / "config.yaml"), "r", encoding="utf-8") as fh:
-            cfg = yaml.safe_load(fh) or {}
+        if cfg is None:
+            cfg = _read_config()
         return ((cfg.get("plugins") or {}).get("idle_compact") or {}) if isinstance(cfg, dict) else {}
     except Exception:
         return {}
 
 
-def _gate_fraction() -> float:
+def _hub_auto_ratio(cfg: dict | None = None) -> float:
+    """Порог автосжатия из хаба настроек (`plugins.entries.*.settings`)."""
+    try:
+        if cfg is None:
+            cfg = _read_config()
+        cfg = cfg or {}
+        entries = (cfg.get("plugins") or {}).get("entries") or {}
+        if not isinstance(entries, dict):
+            return 0.0
+        ordered = []
+        if isinstance(entries.get("idle-compact"), dict):
+            ordered.append(entries["idle-compact"])
+        ordered.extend(v for k, v in entries.items()
+                       if k != "idle-compact" and isinstance(v, dict))
+        for entry in ordered:
+            settings = entry.get("settings")
+            if not isinstance(settings, dict):
+                continue
+            val = settings.get("auto_compact_ratio")
+            if val is not None and float(val) > 0:
+                return float(val)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _gate_fraction(session_id: str | None = None, cfg: dict | None = None) -> float:
     """Доля окна модели, после которой включается фоновое сжатие.
 
-    Задаётся в ``~/.hermes/idle_compact_test.json`` полем ``gate_fraction``
-    или в config.yaml как ``plugins.idle_compact.gate_fraction``. Ноль/нет —
-    работает прежняя формула 2 × цель.
+    Порядок: хаб настроек → ``<HERMES_HOME>/idle_compact_test.json`` (поле
+    ``gate_fraction``) → ``plugins.idle_compact.gate_fraction`` в config.yaml.
+    Ноль/нет — работает прежняя формула 2 × цель.
     """
-    test = _test_settings()
-    for src in (test.get("gate_fraction"), _plugin_cfg().get("gate_fraction")):
+    if cfg is None:
+        cfg = _read_config()
+    hub = _hub_auto_ratio(cfg)
+    if hub > 0:
+        return hub
+    test = _test_settings(session_id)
+    for src in (test.get("gate_fraction"), _plugin_cfg(cfg).get("gate_fraction")):
         try:
             if src is not None and float(src) > 0:
                 return float(src)
@@ -184,40 +322,74 @@ def _gate_fraction() -> float:
     return 0.0
 
 
-def _live_gate(comp=None) -> int | None:
-    test = _test_settings()
+def _live_gate(comp=None, session_id: str | None = None, cfg: dict | None = None) -> int | None:
+    test = _test_settings(session_id)
     if test.get("gate"):
         try:
             return int(test["gate"])
         except Exception:
             pass
-    frac = _gate_fraction()
-    if frac > 0:
-        window = int(getattr(comp, "context_length", 0) or 0)
-        if window > 0:
-            # Порог от ФАКТИЧЕСКОГО окна модели: не зависит от lean/legacy,
-            # threshold и target_ratio — одна понятная величина.
-            return int(frac * window)
-    target = _live_target()
+    if cfg is None:
+        cfg = _read_config()
+    window = int(getattr(comp, "context_length", 0) or 0)
+    frac = _gate_fraction(session_id, cfg)
+    if frac > 0 and window > 0:
+        # Порог от ФАКТИЧЕСКОГО окна модели: не зависит от lean/legacy,
+        # threshold и target_ratio — одна понятная величина.
+        return int(frac * window)
+    # Без доли и без окна — прежняя формула. Окно передаём тем же источником,
+    # что и _gate_floor: доля в compression.threshold без фактического окна не
+    # считается (AGENTS.md), а явный threshold_tokens остаётся главнее окна.
+    target = _live_target(window_tokens=window or None, cfg=cfg)
     return int(target * GATE_K) if target else None
 
 
 def _ttl_for_model(model: str) -> int:
     """TTL модели из общего модуля model_ttl.py."""
-    return ttl_for_model(model)
+    return policy.ttl_for(model)
 
 
-def _delay_for_model(model: str) -> float:
-    test = _test_settings()
+def _evict_ttl(cfg: dict | None = None) -> float:
+    """TTL выселения агента из кеша gateway: config agent.agent_cache.idle_ttl_secs.
+
+    Дефолт — ``policy.AGENT_CACHE_IDLE_TTL_DEFAULT_S`` (значение ядра).
+    Плагин агента только подглядывает, поэтому таймер обязан срабатывать
+    раньше выселения — иначе «agent evicted/absent» и скип.
+    """
+    try:
+        if cfg is None:
+            cfg = _read_config()
+        sec = ((cfg.get("agent") or {}).get("agent_cache") or {}) if isinstance(cfg, dict) else {}
+        val = float(sec.get("idle_ttl_secs") or 0)
+        if val > 0:
+            return val
+    except Exception:
+        pass
+    return policy.AGENT_CACHE_IDLE_TTL_DEFAULT_S
+
+
+def _delay_for_model(model: str, session_id: str | None = None, cfg: dict | None = None) -> float:
+    test = _test_settings(session_id)
     if test.get("seconds"):
         try:
             return float(test["seconds"])
         except Exception:
             pass
-    # Задержка = TTL модели x 0.9: сжатие идёт пока кеш ещё жив.
-    # Карта TTL нужна также для вердикта «был бы кеш тёплым»
-    # и отсечки устаревших дедлайнов.
-    return float(_ttl_for_model(model)) * TTL_FACTOR
+    # Задержка = min(TTL модели, TTL выселения агента) x запас: сжатие идёт
+    # пока живы И провайдерский кеш, И агент в памяти gateway.
+    model_ttl = _ttl_for_model(model)
+    if cfg is None:
+        cfg = _read_config()
+    evict = _evict_ttl(cfg)
+    if model_ttl > evict and model not in _warned_evict_cap:
+        _warned_evict_cap.add(model)
+        logger.warning(
+            "idle-compact: %s: кеш живёт %dс, но Hermes выселяет агент "
+            "через %dс — таймер урезан до %dс. Поднимите "
+            "agent.agent_cache.idle_ttl_secs для полного TTL.",
+            model, model_ttl, int(evict), int(policy.schedule_delay_for(model, evict)),
+        )
+    return policy.schedule_delay_for(model, evict)
 
 
 def _rough_tokens(session_id: str) -> int:
@@ -256,11 +428,13 @@ def scan_candidates() -> list[dict]:
     con = sqlite3.connect(f"file:{_state_db()}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     try:
+        _flt, _params = _human_filter_sql()
         cur = con.execute(
             "SELECT id, source, model, message_count, last_activity_at "
             "FROM sessions WHERE archived = 0 AND ended_at IS NULL "
-            "AND source IN ('telegram','desktop','cli','tui','messaging','local') "
-            "ORDER BY last_activity_at DESC LIMIT 50"
+            + _flt +
+            "ORDER BY last_activity_at DESC LIMIT 50",
+            _params,
         )
         rows = [dict(r) for r in cur.fetchall()]
     finally:
@@ -284,6 +458,77 @@ def scan_candidates() -> list[dict]:
 _timers: dict[str, threading.Timer] = {}
 _timers_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Guard от двойного сжатия: ядро сжало — мы пропускаем
+# ---------------------------------------------------------------------------
+
+# Сколько секунд помним ядерное сжатие сессии — см. policy.py.
+_CORE_COMPACTION_TTL_S = policy.CORE_COMPACTION_TTL_S
+
+# {session_id: (когда ядро сжало, размер после)} — только в памяти:
+# таймеры тоже не переживают рестарт, хранить на диске нечего.
+_core_compactions: dict[str, tuple[float, int | None]] = {}
+_core_compactions_lock = threading.Lock()
+
+
+def _on_post_compaction(session_id=None, old_session_id=None, after_tokens=None,
+                        reason=None, **kw) -> None:
+    """Ядро сжало сессию: запоминаем, чтобы таймер её пропустил.
+
+    Публичный хук ``post_compaction`` (см. VALID_HOOKS): reason несёт триггер
+    (``cache_expiry`` — ядерное сжатие в простое), after_tokens — свежий размер.
+    Пишем оба id: ядро иногда продолжает беседу в дочерней сессии.
+    """
+    try:
+        now = time.time()
+        after = int(after_tokens) if after_tokens is not None else None
+    except Exception:
+        return
+    ids = [i for i in (session_id, old_session_id) if i]
+    if not ids:
+        return
+    with _core_compactions_lock:
+        for sid in ids:
+            _core_compactions[str(sid)] = (now, after)
+        # Чистка старья заодно: словарь не растёт без bound.
+        cutoff = now - _CORE_COMPACTION_TTL_S
+        for sid in [s for s, (ts, _) in _core_compactions.items() if ts < cutoff]:
+            del _core_compactions[sid]
+    logger.info(
+        "idle-compact: ядро сжало %s (reason=%s, after=%s) — guard взведён",
+        session_id, reason, after,
+    )
+
+
+def _core_record(session_id: str) -> tuple[float, int | None] | None:
+    """Запись о ядерном сжатии сессии или None (протухшие стираем)."""
+    with _core_compactions_lock:
+        rec = _core_compactions.get(session_id)
+        if rec is not None and time.time() - rec[0] > _CORE_COMPACTION_TTL_S:
+            _core_compactions.pop(session_id, None)
+            return None
+        return rec
+
+
+def _apply_core_size(session_id: str, size: int,
+                     measured_at: float | None = None) -> int:
+    """Свежий размер из записи ядра вместо протухшей оценки.
+
+    ``last_prompt_tokens`` обновляется только на запросах, а ядерное сжатие
+    запроса не делает — без этого таймер видел бы старый большой размер.
+
+    Подмена действует, только пока замер СТАРШЕ сжатия (``measured_at``).
+    Замер, сделанный после него, уже описывает сжатый контекст: сессия,
+    выросшая с 50К до 300К после сжатия, не должна читаться как 50К — иначе
+    гейт не срабатывает до конца жизни записи (четыре часа).
+    """
+    rec = _core_record(session_id)
+    if rec is None or rec[1] is None:
+        return size
+    if measured_at is not None and measured_at > rec[0]:
+        return size
+    return min(size, rec[1])
+
 # Ожидающие таймеры переживают reload плагина: {session_id: {deadline, stamp, model}}
 _PENDING_FILE = "idle_compact_pending.json"
 
@@ -293,13 +538,14 @@ def _pending_path() -> Path:
 
 
 @contextlib.contextmanager
-def _pending_guard():
+def _file_guard(path: Path):
     """Эксклюзивный доступ к файлу состояния между процессами.
 
     Без этого 89 загрузок плагина в сутки перетирали чужие записи: каждый
     процесс писал «только то, что восстановил он», и таймеры терялись.
+    Блокировка лежит в файле ``<имя>.lock'' рядом с состоянием: у каждого
+    файла она своя, а имя то же, что у прежней `_pending_guard`.
     """
-    path = _pending_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(".lock")
     fh = None
@@ -311,7 +557,7 @@ def _pending_guard():
 
         _lock_fh(fh)
     except Exception:
-        logger.debug("idle-compact: pending lock unavailable", exc_info=True)
+        logger.debug("idle-compact: state lock unavailable for %s", path, exc_info=True)
     try:
         yield
     finally:
@@ -325,6 +571,13 @@ def _pending_guard():
                 fh.close()
             except Exception:
                 pass
+
+
+@contextlib.contextmanager
+def _pending_guard():
+    """Эксклюзивный доступ к файлу дедлайнов (см. `_file_guard`)."""
+    with _file_guard(_pending_path()):
+        yield
 
 
 def _load_pending() -> dict[str, dict]:
@@ -349,6 +602,128 @@ def _save_pending(state: dict[str, dict]) -> None:
         tmp.replace(path)
     except Exception:
         logger.exception("idle-compact: pending state write failed")
+
+
+def _windows_path():
+    return _home() / "idle_compact_windows.json"
+
+
+def _note_window(model: str, window: int) -> None:
+    """Запомнить фактическое окно модели (видели у живого компрессора).
+
+    Окна не меняются со временем — перезаписываем без TTL. Нужно панели:
+    порог в токенах = доля × окно, а живого компрессора под рукой может не быть.
+    """
+    try:
+        window = int(window or 0)
+        model = str(model or "").strip()
+        if window <= 0 or not model:
+            return
+        import json
+
+        path = _windows_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data = data if isinstance(data, dict) else {}
+        except Exception:
+            data = {}
+        if data.get(model) == window:
+            return
+        data[model] = window
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.debug("idle-compact: window cache write failed", exc_info=True)
+
+
+def _cached_window(model: str) -> int:
+    """Окно модели из кеша. Не видели — 0. Только чтение."""
+    try:
+        import json
+
+        data = json.loads(_windows_path().read_text(encoding="utf-8"))
+        return int((data or {}).get(str(model or "")) or 0)
+    except Exception:
+        return 0
+
+
+def _usage_path():
+    return _home() / "idle_compact_usage.json"
+
+
+# Последний замер по сессии в этом процессе: троттлинг записи файла.
+_usage_last_write: dict[str, tuple[float, int]] = {}
+
+
+def _note_usage(session_id: str, tokens: int) -> None:
+    """Запомнить реальный размер промпта сессии (usage API, не оценка).
+
+    Оценка по символам занижает в 2–3 раза и врёт даже сторону порога
+    (129K против реальных 366K) — панели/чипу отдаём только замер.
+    Записи старше 7 суток подчищаем тут же.
+
+    Вызывается на каждый ответ модели (десятки за ход с инструментами),
+    файл делят два процесса (gateway + serve) — поэтому троттлинг
+    (не чаще ~10 с и при изменении от 1%) и атомарная запись.
+    """
+    try:
+        tokens = int(tokens or 0)
+        session_id = str(session_id or "")
+        if tokens <= 0 or not session_id:
+            return
+        import json
+        import time as _time
+
+        now = _time.time()
+        prev = _usage_last_write.get(session_id)
+        if prev is not None:
+            pts, ptok = prev
+            if now - pts < 10.0 and abs(tokens - ptok) <= max(1, ptok // 100):
+                return
+        path = _usage_path()
+        # Вся последовательность чтение → слияние → os.replace под тем же
+        # эксклюзивным локом, что и файл дедлайнов: иначе gateway и serve
+        # читают одно состояние, каждый дописывает своё, и последний
+        # затирает чужую сессию целиком.
+        with _file_guard(path):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                data = data if isinstance(data, dict) else {}
+            except Exception:
+                data = {}
+            data = {k: v for k, v in data.items()
+                    if now - float((v or {}).get("ts") or 0) < 7 * 86400}
+            if (data.get(session_id) or {}).get("tokens") == tokens:
+                _usage_last_write[session_id] = (now, tokens)
+                return
+            data[session_id] = {"tokens": tokens, "ts": now}
+            # Уникальный файл в том же каталоге: общий `<имя>.tmp` два
+            # писателя дописывали в один и тот же буфер.
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(data, ensure_ascii=False))
+                os.replace(tmp_name, path)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    os.unlink(tmp_name)
+                raise
+        _usage_last_write[session_id] = (now, tokens)
+    except Exception:
+        logger.debug("idle-compact: usage cache write failed", exc_info=True)
+
+
+def _cached_usage(session_id: str) -> int:
+    """Реальный размер сессии из кеша. Не видели — 0. Только чтение."""
+    import json
+
+    for _ in range(2):  # второй шанс при чтении в момент чужой записи
+        try:
+            data = json.loads(_usage_path().read_text(encoding="utf-8"))
+            return int(((data or {}).get(str(session_id or "")) or {}).get("tokens") or 0)
+        except Exception:
+            continue
+    return 0
 
 
 def _pid_alive(pid: int) -> bool:
@@ -392,16 +767,20 @@ def _forget(session_id: str) -> None:
 
 
 def _resident(session_id: str):
-    """(agent, compressor, route) живой сессии или None. Только чтение.
+    """(agent, compressor, route, runner) живой сессии или None. Только чтение.
 
     Причину отсутствия пишем в лог (один раз за сессию): без неё диагностика
     «api_size=n/a» бесполезна — непонятно, нет runner, нет ключа или нет агента.
+
+    ``runner`` возвращаем наружу: он нужен вызывающему, чтобы после сжатия
+    вернуть агента в кеш. Раньше он терялся и eviction на обычном пути падал.
     """
     try:
-        from gateway.run import _gateway_runner_ref, _cached_agent_for_hygiene
+        from gateway.run import _gateway_runner_ref
     except Exception as exc:
         _resident_reason(session_id, f"gateway import failed: {type(exc).__name__}")
         return None
+    runner = None
     try:
         runner = _gateway_runner_ref()
     except Exception as exc:
@@ -419,6 +798,11 @@ def _resident(session_id: str):
         _resident_reason(session_id, "session has no session_key in db")
         return None
     try:
+        from gateway.run import _cached_agent_for_hygiene
+    except Exception as exc:
+        _resident_reason(session_id, f"cache lookup import failed: {type(exc).__name__}")
+        return None
+    try:
         agent = _cached_agent_for_hygiene(runner, route)
     except Exception as exc:
         _resident_reason(session_id, f"cache lookup failed: {type(exc).__name__}")
@@ -433,7 +817,8 @@ def _resident(session_id: str):
     if comp is None:
         _resident_reason(session_id, "agent has no context_compressor")
         return None
-    return agent, comp, route
+    _resident_found(session_id)
+    return agent, comp, route, runner
 
 
 def _resident_desktop(session_id: str):
@@ -454,12 +839,15 @@ def _resident_desktop(session_id: str):
         _resident_reason(session_id, f"tui_gateway._sessions is {type(sessions).__name__}")
         return None
     # Подробный снимок реестра: без него не видно, почему сессия не находится.
+    # В debug, а не INFO: этот вызов идёт на каждый опрос статуса, а построчный
+    # INFO уходит в канал ошибок десктопа. На промахе ниже всё равно пишется
+    # одноразовый INFO с ключами реестра.
     try:
         _snap = []
         for _k, _s in list(sessions.items())[:8]:
             _a = _s.get("agent") if isinstance(_s, dict) else None
             _snap.append(f"{str(_k)[:12]}→{getattr(_a, 'session_id', None)}")
-        logger.info(
+        logger.debug(
             "idle-compact: реестр desktop — сессий=%d, ищем=%s, состав=%s",
             len(sessions), session_id[-12:], "; ".join(_snap) or "пусто",
         )
@@ -480,7 +868,8 @@ def _resident_desktop(session_id: str):
                     f"{sum(1 for a in dir(agent) if 'compress' in a.lower())} similar attrs)",
                 )
                 return None
-            return agent, comp, str(sess.get("session_key") or session_id)
+            _resident_found(session_id)
+            return agent, comp, str(sess.get("session_key") or session_id), None
     _resident_reason(
         session_id,
         f"desktop registry has no match (keys: {[str(k)[:10] for k in list(sessions)[:5]]})",
@@ -488,28 +877,123 @@ def _resident_desktop(session_id: str):
     return None
 
 
+def _ui_session_id(session_key: str) -> str | None:
+    """Runtime id tui-сессии (uuid4 hex[:8]) — то, что десктоп зовёт activeSessionId.
+
+    Агентский ключ (`20261115_181244_8773dc`) и runtime id (`7bf26255`) —
+    разные пространства (ядро явно реджектит 8-hex как session_key).
+    JS-фильтр сравнивает с activeSessionId, поэтому в payload кладём оба.
+    Ищем в том же реестре, что `_resident_desktop`.
+    """
+    try:
+        from tui_gateway import server as tui
+    except Exception:
+        return None
+    try:
+        sessions = getattr(tui, "_sessions", None)
+        if not isinstance(sessions, dict):
+            return None
+        for key, sess in list(sessions.items()):
+            if not isinstance(sess, dict):
+                continue
+            if sess.get("session_key") == session_key or getattr(
+                    sess.get("agent"), "session_id", None) == session_key:
+                return str(key)
+    except Exception:
+        return None
+    return None
+
+
 _warned_resident: set[str] = set()
 _last_warm_usage: dict | None = None
+_history_db = None
+
+
+def _once_info(session_id: str, kind: str, msg: str, *args) -> None:
+    """Один INFO на пару (сессия, вид), повторы — в debug.
+
+    Построчный INFO из хуков (post_api идёт на каждый ход) уходит в канал
+    ошибок десктопа и дальше мостом в Telegram. Ключ — статичный вид,
+    а не полный текст: в текст попадают волатильные данные (состав реестра),
+    и ключ из полного текста не срабатывал бы повторно.
+    """
+    key = (session_id, kind)
+    if key in _warned_resident:
+        logger.debug(msg, *args)
+        return
+    if len(_warned_resident) > 2000:
+        _warned_resident.clear()
+    _warned_resident.add(key)
+    logger.info(msg, *args)
 
 
 def _resident_reason(session_id: str, reason: str) -> None:
     """Причина отсутствия агента.
 
-    Логируем каждый раз: одноразовый лог уже стоил нескольких циклов отладки —
-    первая причина оставалась в прошлом, а последующие срабатывания молчали.
-    Таймер срабатывает раз в несколько минут, спама это не даёт.
+    Один INFO на пару (сессия, причина), повторы — в debug: построчный INFO
+    при опросе статуса уходит в канал ошибок десктопа и дальше мостом
+    в Telegram («нет живого агента» ×2 на каждый опрос чужой сессии).
+    Разные причины видны все — каждая по разу; при появлении живого агента
+    пометки сбрасываются (см. ``_resident_found``), следующий простой снова
+    предупредит один раз. Волатильный хвост причины (состав реестра)
+    в ключ не входит — только в текст строки.
     """
-    logger.info("idle-compact: нет живого агента для %s — %s", session_id, reason)
+    kind = "resident:" + reason.split(" (keys:")[0]
+    _once_info(
+        session_id,
+        kind,
+        "idle-compact: нет живого агента для %s — %s",
+        session_id,
+        reason,
+    )
+
+
+def _resident_found(session_id: str) -> None:
+    """Агент нашёлся: сбросить одноразовые пометки, чтобы следующий простой
+    снова предупредил один раз, а не молчал вечно."""
+    if _warned_resident:
+        _warned_resident.difference_update(
+            [k for k in list(_warned_resident) if k[0] == session_id]
+        )
+
+
+def _history_getter(comp):
+    """Функция ``(session_id) -> messages``: публичный SessionDB, иначе приватный.
+
+    Публичный ``hermes_state.SessionDB(read_only=True)`` — стабильный API;
+    приватный ``comp._session_db`` оставляем запасным путём для сборок, где
+    публичного чтения ещё нет.
+    """
+    global _history_db
+    try:
+        if _history_db is None:
+            from hermes_state import SessionDB
+            # Без явного пути: SessionDB сам берёт DEFAULT_DB_PATH и учитывает
+            # переопределения (--db, профили), иначе читаем чужую базу.
+            _history_db = SessionDB(read_only=True)
+        fn = getattr(_history_db, "get_messages_as_conversation", None)
+        if callable(fn):
+            return fn
+    except Exception:
+        pass
+    db = getattr(comp, "_session_db", None)
+    fn = getattr(db, "get_messages_as_conversation", None)
+    return fn if callable(fn) else None
 
 
 def _estimate_history(comp, session_id: str) -> int | None:
     """Точная оценка ядра по истории из БД. None — не вышло."""
     try:
-        db = getattr(comp, "_session_db", None)
-        get_conv = getattr(db, "get_messages_as_conversation", None)
+        get_conv = _history_getter(comp)
         if not callable(get_conv):
             return None
         history = get_conv(session_id)
+        if not history:
+            # Публичное чтение вернуло пусто (другая БД/профиль) — падаем на
+            # приватный handle компрессора, чтобы не скипать сессию молча.
+            fb = getattr(getattr(comp, "_session_db", None), "get_messages_as_conversation", None)
+            if callable(fb):
+                history = fb(session_id)
         messages = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
         from agent.model_metadata import estimate_messages_tokens_rough
         return int(estimate_messages_tokens_rough(messages))
@@ -520,6 +1004,12 @@ def _estimate_history(comp, session_id: str) -> int | None:
 def _fire(session_id: str, stamp: float, model: str, ctx=None) -> None:
     with _timers_lock:
         _timers.pop(session_id, None)
+    # Guard: ядро сжало сессию после взвода таймера — пропускаем, не глядя
+    # на числа (наш гейт может быть ниже ядерного остатка).
+    rec = _core_record(session_id)
+    if rec is not None and rec[0] > stamp:
+        logger.info("idle-compact: session %s compacted by core, skip", session_id)
+        return
     # Чужой дедлайн (другого процесса) не трогаем: его разбудит владелец.
     try:
         with _pending_guard():
@@ -534,7 +1024,7 @@ def _fire(session_id: str, stamp: float, model: str, ctx=None) -> None:
         row = _session_row(session_id)
         if not row:
             return
-        if row.get("source") not in HUMAN_SOURCES:
+        if _is_machine_source(row.get("source")):
             return
         last_ts = row.get("last_activity_at") or 0
         if last_ts > stamp:
@@ -550,22 +1040,30 @@ def _fire(session_id: str, stamp: float, model: str, ctx=None) -> None:
         res = _resident(session_id)
         agent_live = None
         route_live = ""
+        runner_live = None
         if res is not None:
-            agent_live, comp, route_live = res
-            floor = _gate_floor(comp)
+            agent_live, comp, route_live, runner_live = res
+            _note_window(model, getattr(comp, "context_length", 0))
+            floor = _gate_floor(comp, session_id)
             if floor is not None:
                 # Реальный размер последнего промпта из usage API: оценка по
                 # символам занижает в 2–3 раза (JSON, tool_calls, system prompt).
                 api_size = int(getattr(comp, "last_prompt_tokens", 0) or 0)
+                _note_usage(session_id, api_size)
                 est = _estimate_history(comp, session_id)
                 exact = max(api_size, est or 0) or None
         if floor is None:
-            gate = _live_gate(comp)
+            gate = _live_gate(comp, session_id)
             if gate is None:
                 logger.info("idle-compact: session %s no live gate, skip", session_id)
                 return
             floor = gate
         size = exact if exact is not None else _rough_tokens(session_id)
+        # Guard: свежий размер из записи ядра вместо протухшей оценки.
+        # ``last_ts`` — момент последнего хода сессии: он же верхняя граница
+        # времени замера (``last_prompt_tokens`` пишется запросом, оценка
+        # читает БД, которую тот же ход и обновил).
+        size = _apply_core_size(session_id, size, measured_at=last_ts or None)
         idle_min = (time.time() - last_ts) / 60 if last_ts else -1
         if size <= floor:
             logger.info(
@@ -585,7 +1083,8 @@ def _fire(session_id: str, stamp: float, model: str, ctx=None) -> None:
             return
         # -- боевое сжатие: allowlist как опциональный ограничитель --
         if WRITE_ENABLED and (not ALLOWLIST or session_id in ALLOWLIST):
-            _do_compress(session_id, model, size, ctx, agent=agent_live, route=route_live)
+            _do_compress(session_id, model, size, ctx, agent=agent_live,
+                         route=route_live, runner=runner_live, idle_since=stamp)
             return
         logger.info("idle-compact: write path not yet enabled, skip %s", session_id)
     except Exception:
@@ -593,6 +1092,62 @@ def _fire(session_id: str, stamp: float, model: str, ctx=None) -> None:
 
 
 _post_api_seen: set[str] = set()
+
+
+def _push_status(session_id: str) -> None:
+    """Отправить чип+панель событием на канал сессии.
+
+    Session-события идут тем же каналом, что сообщения чата, — он точно
+    доходит до десктопа, включая SSH (`serve`). Глобальный broadcast
+    остаётся запасным путём (нет вьювера/authority — вернёт False).
+    RPC (`host.request`) доходит только до gateway-маршрута.
+    """
+    try:
+        from hermes_cli import plugin_events as _pe
+    except Exception:
+        return
+    try:
+        res = _rpc_status({"session_id": session_id}, _exact=False)
+        if not isinstance(res, dict):
+            return
+        res = dict(res)
+        res["ts"] = time.time()
+        # Оба пространства id: runtime (activeSessionId в десктопе) и
+        # агентский ключ. JS принимает событие при совпадении любого.
+        res["session_id"] = _ui_session_id(session_id) or session_id
+        res["session_key"] = res["agent_session_id"] = session_id
+        try:
+            sent = bool(_pe.emit_plugin_session_event(
+                "idle-compact", session_id, "status", res))
+        except Exception:
+            sent = False
+        if not sent:
+            try:
+                _pe.broadcast_plugin_event("idle-compact", "status", res)
+            except Exception:
+                logger.debug("idle-compact: status broadcast failed", exc_info=True)
+    except Exception:
+        logger.debug("idle-compact: status push failed", exc_info=True)
+
+
+def _payload_prompt_tokens(kw: dict) -> int:
+    """Свежий размер промпта из события post_api_request.
+
+    Хук стреляет раньше, чем ядро записывает usage ответа, — читать
+    ``comp.last_prompt_tokens`` здесь значит брать предыдущий запрос.
+    В событии уже лежит usage текущего: готовое ``prompt_tokens``,
+    иначе канон ядра (вход + чтение + запись кеша).
+    """
+    try:
+        usage = kw.get("usage") or {}
+        direct = int(usage.get("prompt_tokens") or 0)
+        if direct > 0:
+            return direct
+        return (int(usage.get("input_tokens") or usage.get("input") or 0)
+                + int(usage.get("cache_read_tokens") or usage.get("cache_read") or 0)
+                + int(usage.get("cache_write_tokens") or usage.get("cache_write") or 0))
+    except Exception:
+        return 0
 
 
 def _on_post_api(session_id: str = "", **kwargs) -> None:
@@ -610,9 +1165,77 @@ def _on_post_api(session_id: str = "", **kwargs) -> None:
         _post_api_seen.add(session_id)
         logger.info("idle-compact: post_api hook reached %s", session_id)
     try:
+        _note_usage(session_id, _payload_prompt_tokens(kwargs))
+    except Exception:
+        logger.debug("idle-compact: usage note failed", exc_info=True)
+    try:
+        _arm_engine(session_id)
+    except Exception:
+        logger.debug("idle-compact: engine arm failed", exc_info=True)
+    try:
         _on_session_end(session_id=session_id)
     except Exception:
         logger.exception("idle-compact: timer hook failed for %s", session_id)
+    try:
+        _push_status(session_id)
+    except Exception:
+        logger.debug("idle-compact: status push hook failed", exc_info=True)
+
+
+def _arm_engine(session_id: str) -> None:
+    """Держим движок агента заряженным последним реальным запросом.
+
+    Сжатие запускает не только наш таймер: ядро делает это само
+    (``compression.prepare_ahead``, post-turn, inline при переполнении). Если у
+    движка уже лежит свежий захват, любой из этих путей пойдёт по тёплому кешу
+    без нашего участия — ровно то, что нужно для сокращения приватного кода.
+    """
+    cap = _capture_for(session_id)
+    if not cap:
+        _once_info(
+            session_id, "arm:no-capture",
+            "idle-compact: взвод пропущен — нет свежего захвата сессии %s", session_id[:24],
+        )
+        return
+    ts = float(cap.get("ts") or 0)
+    model = cap.get("model") or ""
+    # Старше окна кеша повтор бессмыслен: префикса уже нет у провайдера.
+    if not ts or time.time() - ts > policy.arm_window_for(model):
+        _once_info(
+            session_id, "arm:stale-capture",
+            "idle-compact: взвод пропущен — захват старее окна (%.0fс > %.0fс) для %s",
+            time.time() - ts, policy.arm_window_for(model), session_id[:24],
+        )
+        return
+    found = _resident(session_id)
+    if not found:
+        _once_info(
+            session_id, "arm:no-agent",
+            "idle-compact: взвод пропущен — агент не найден в этом процессе (%s)", session_id[:24],
+        )
+        return
+    agent, comp, _route, _runner = found
+    begin = getattr(comp, "begin_warm", None)
+    if not callable(begin):
+        _once_info(
+            session_id, "arm:no-begin",
+            "idle-compact: взвод пропущен — у компрессора нет begin_warm (%s)",
+            type(comp).__name__,
+        )
+        return
+    _note_window(cap.get("model") or getattr(agent, "model", ""), getattr(comp, "context_length", 0))
+    # Замер usage — из события post_api (см. _on_post_api): читать
+    # comp.last_prompt_tokens здесь нельзя, хук стреляет раньше записи usage.
+    route = {
+        "api_mode": cap.get("api_mode") or getattr(agent, "api_mode", ""),
+        "base_url": cap.get("base_url") or getattr(agent, "base_url", ""),
+        "api_key": getattr(agent, "api_key", ""),
+        "session_id": session_id,
+        "provider": getattr(agent, "provider", ""),
+        "model": cap.get("model") or getattr(agent, "model", ""),
+        "_cap_ts": ts,
+    }
+    begin(cap, route)
 
 
 def _on_session_end(session_id: str = "", **kwargs) -> None:
@@ -623,14 +1246,15 @@ def _on_session_end(session_id: str = "", **kwargs) -> None:
     except Exception:
         logger.exception("idle-compact: db read failed")
         return
-    if not row or row.get("source") not in HUMAN_SOURCES:
+    if not row or _is_machine_source(row.get("source")):
         logger.debug(
-            "idle-compact: session %s source %r not human, no timer",
+            "idle-compact: session %s source %r is machine, no timer",
             session_id, (row or {}).get("source"),
         )
         return
     model = row.get("model") or ""
-    delay = _delay_for_model(model)
+    cfg = _read_config()  # один парс на вызов хука — дальше только проброс
+    delay = _delay_for_model(model, session_id, cfg)
     stamp = time.time()
     try:
         from contextvars import copy_context
@@ -646,18 +1270,18 @@ def _on_session_end(session_id: str = "", **kwargs) -> None:
         _timers[session_id] = t
         t.start()
     _remember(session_id, stamp + delay, stamp, model)
-    gate = _live_gate()
+    gate = _live_gate(session_id=session_id, cfg=cfg)
     logger.info(
         "idle-compact: timer %.0fs for session %s model %s (gate %s | test=%s ttl=%s)",
         delay, session_id, model, gate if gate is not None else "n/a",
-        _test_settings() or "-", _ttl_for_model(model),
+        _test_settings(session_id) or "-", _ttl_for_model(model),
     )
 
 
-def _gate_floor(compressor) -> int | None:
+def _gate_floor(compressor, session_id: str | None = None) -> int | None:
     """Пол из живого порога компрессора + anti-thrash. Нет данных — None (скип)."""
     # Тестовый режим: явный гейт из файла имеет приоритет.
-    test = _test_settings()
+    test = _test_settings(session_id)
     if test.get("gate"):
         try:
             return int(test["gate"])
@@ -671,7 +1295,8 @@ def _gate_floor(compressor) -> int | None:
             target = int(thr * ratio)
     except Exception:
         target = None
-    frac = _gate_fraction()
+    _gcfg = _read_config()  # один парс — дальше только проброс
+    frac = _gate_fraction(session_id, _gcfg)
     window_now = int(getattr(compressor, "context_length", 0) or 0)
     if frac > 0 and window_now > 0:
         # Порог от окна модели — приоритетнее цели и режима.
@@ -679,7 +1304,7 @@ def _gate_floor(compressor) -> int | None:
     if target is None:
         # Фактическое окно модели из живого компрессора — не выдуманное.
         window = int(getattr(compressor, "context_length", 0) or 0)
-        target = _live_target(window_tokens=window or None)
+        target = _live_target(window_tokens=window or None, cfg=_gcfg)
     if target is None:
         return None
     floor = int(target * GATE_K)
@@ -689,7 +1314,8 @@ def _gate_floor(compressor) -> int | None:
     return floor
 
 
-def _do_compress(session_id: str, model: str, size: int, ctx, agent=None, route: str = "") -> None:
+def _do_compress(session_id: str, model: str, size: int, ctx, agent=None,
+                 route: str = "", runner=None, idle_since: float | None = None) -> None:
     """Боевое сжатие через resident-агента: весь коммит делает ядро.
 
     ``agent`` приходит из ``_resident`` — он уже нашёл живого агента (в том
@@ -741,13 +1367,16 @@ def _do_compress(session_id: str, model: str, size: int, ctx, agent=None, route:
     except Exception:
         logger.info("idle-compact: session %s cooldown check failed, skip", session_id)
         return
-    db = getattr(comp, "_session_db", None)
-    get_conv = getattr(db, "get_messages_as_conversation", None)
+    get_conv = _history_getter(comp)
     if not callable(get_conv):
         logger.info("idle-compact: no db handle on compressor, skip %s", session_id)
         return
     try:
         history = get_conv(session_id)
+        if not history:
+            fb = getattr(getattr(comp, "_session_db", None), "get_messages_as_conversation", None)
+            if callable(fb):
+                history = fb(session_id)
     except Exception:
         logger.exception("idle-compact: history load failed")
         return
@@ -757,7 +1386,7 @@ def _do_compress(session_id: str, model: str, size: int, ctx, agent=None, route:
         exact = int(estimate_messages_tokens_rough(messages))
     except Exception:
         exact = size
-    floor = _gate_floor(comp)
+    floor = _gate_floor(comp, session_id)
     if floor is None:
         logger.info("idle-compact: session %s no live floor, skip", session_id)
         return
@@ -771,17 +1400,23 @@ def _do_compress(session_id: str, model: str, size: int, ctx, agent=None, route:
         session_id, model, exact)
     try:
         from . import savings
-        savings.begin_compaction(session_id, model, exact)
+        savings.begin_compaction(session_id, model, exact, idle_since=idle_since)
     except Exception:
         logger.exception("idle-compact: savings begin failed")
 
+    did_compress = False
+
     def work() -> None:
+        nonlocal did_compress
         try:
             fence = None
             try:
                 from agent.conversation_compression import CompressionCommitFence
                 fence = CompressionCommitFence()
             except Exception:
+                # Ядро само создаёт fence, если плагин его не передал
+                # (agent/compression_facade.py): без него сжатие всё равно
+                # защищено, поэтому здесь не отказываемся от работы.
                 fence = None
             kwargs: dict = {"approx_tokens": exact, "task_id": session_id,
                             "trigger": "idle_background"}
@@ -789,6 +1424,10 @@ def _do_compress(session_id: str, model: str, size: int, ctx, agent=None, route:
                 kwargs["commit_fence"] = fence
 
             def run() -> None:
+                # Флаг успеха живёт во внешней функции: без nonlocal запись
+                # уходила в локальную переменную run(), а guard выселения в
+                # finally читал всегда False.
+                nonlocal did_compress
                 # Включаем warm-путь: префикс = последний реальный запрос сессии.
                 engine = getattr(agent, "context_compressor", None)
                 warm_on = False
@@ -830,6 +1469,27 @@ def _do_compress(session_id: str, model: str, size: int, ctx, agent=None, route:
                                 )
                         except Exception:
                             logger.debug("idle-compact: end_warm failed", exc_info=True)
+                    # Сжатие могло не состояться: ядро держит лизинг (другой
+                    # воркер уже сжимает) или прервало попытку. Тогда агент
+                    # выселять нельзя — уничтожим тёплый кеш без сжатия.
+                    comp_obj = getattr(agent, "context_compressor", None)
+                    skipped = bool(getattr(comp_obj, "_compression_skipped_due_to_lock", False))
+                    aborted = bool(getattr(agent, "_last_compress_aborted", False))
+                    shrank = True
+                    if not (skipped or aborted):
+                        try:
+                            from agent.model_metadata import estimate_messages_tokens_rough
+                            _now = get_conv(session_id)
+                            _rows = [m for m in (_now or []) if isinstance(m, dict)]
+                            shrank = int(estimate_messages_tokens_rough(_rows)) < int(size)
+                        except Exception:
+                            shrank = True
+                    did_compress = not (skipped or aborted) and shrank
+                    if not did_compress:
+                        logger.info(
+                            "idle-compact: сжатие не выполнено (lock=%s abort=%s shrank=%s) — агент не выселяем",
+                            skipped, aborted, shrank,
+                        )
 
             if ctx is not None:
                 ctx.run(run)
@@ -860,12 +1520,25 @@ def _do_compress(session_id: str, model: str, size: int, ctx, agent=None, route:
             except Exception:
                 pass
         finally:
-            evict = getattr(runner, "_evict_cached_agent", None)
-            if callable(evict):
-                try:
-                    evict(route)
-                except Exception:
-                    pass
+            # Выселяем агента только если сжатие реально шло (иначе выкинем
+            # живой агент без причины) и только когда в кеше лежит тот же
+            # объект. Проверка неатомарна — это best-effort, как и в ядре;
+            # не смогли подтвердить совпадение — не трогаем.
+            # (без return: return в finally глушит летящее исключение.)
+            if did_compress and runner is not None:
+                evict = getattr(runner, "_evict_cached_agent", None)
+                if callable(evict):
+                    try:
+                        same = False
+                        try:
+                            from gateway.run import _cached_agent_for_hygiene
+                            same = _cached_agent_for_hygiene(runner, route) is agent
+                        except Exception:
+                            same = False
+                        if same:
+                            evict(route)
+                    except Exception:
+                        pass
 
     th = threading.Thread(target=work, daemon=True, name=f"idle-compact-{session_id[:8]}")
     th.start()
@@ -891,7 +1564,7 @@ def _restore_pending() -> None:
             continue
         row = _session_row(session_id)
         # Сессия исчезла/закрыта/не human — забываем
-        if not row or row.get("source") not in HUMAN_SOURCES or row.get("ended_at"):
+        if not row or _is_machine_source(row.get("source")) or row.get("ended_at"):
             dropped += 1
             continue
         # Уже был активный ход после нашего таймера — ждать нечего
@@ -901,8 +1574,8 @@ def _restore_pending() -> None:
         # Дедлайн просрочен настолько, что кеш всё равно мёртв (реальный случай:
         # рестарт через 2.5 часа после дедлайна, сжатие ушло холодным).
         # Сжимать по такой метке бессмысленно — это сделает ядро при возврате.
-        ttl = _delay_for_model(model)
-        if now - deadline > max(ttl * 2, 3600):
+        ttl = _delay_for_model(model, session_id)
+        if now - deadline > policy.watchdog_grace(ttl):
             dropped += 1
             continue
         delay = max(0.0, deadline - now)
@@ -984,12 +1657,6 @@ def _on_llm_execution(request=None, next_call=None, **kw) -> None:
                     _tools_chars = len(_json.dumps(_tools, ensure_ascii=False))
                 except Exception:
                     _tools_chars = -1
-                try:  # отладочный дамп: нужен, чтобы воспроизвести warm вне плагина
-                    import json as _j
-                    (_home() / f"idle_capture_{sid}.json").write_text(
-                        _j.dumps(body, ensure_ascii=False), encoding="utf-8")
-                except Exception:
-                    pass
                 logger.info(
                     "idle-compact: захват %s — строк=%d символов_истории=%d "
                     "instructions_символов=%d tools_символов=%d cache_key=%s",
@@ -1036,12 +1703,16 @@ def _on_pre_api_request(**kw) -> None:
 def _capture_for(session_id: str) -> dict | None:
     with _captures_lock:
         entry = _captures.get(session_id)
-    if not entry:
-        return None
-    # Старше TTL кеша — префикс уже не тёплый, повтор бессмысленен
-    if time.time() - float(entry.get("ts") or 0) > 7200:
-        return None
-    return entry
+        if not entry:
+            return None
+        # Старше TTL кеша — префикс уже не тёплый, повтор бессмыслен.
+        # Протухшую запись выбрасываем: иначе тело запроса висит в памяти
+        # до следующего хода этой сессии или до смерти процесса.
+        age = time.time() - float(entry.get("ts") or 0)
+        if age > policy.capture_max_age_for(entry.get("model") or ""):
+            _captures.pop(session_id, None)
+            return None
+        return entry
 
 
 _watchdog_started = False
@@ -1071,9 +1742,9 @@ def _sweep_due() -> int:
             stamp = float(entry.get("stamp") or 0)
             model = str(entry.get("model") or "")
             deadline = float(entry.get("deadline") or 0)
-            ttl = _delay_for_model(model)
+            ttl = _delay_for_model(model, sid)
             # Совсем старые дедлайны не трогаем: кеш давно мёртв, сожмёт ядро при возврате.
-            if now - deadline > max(ttl * 2, 3600):
+            if now - deadline > policy.watchdog_grace(ttl):
                 _forget(sid)
                 logger.info("idle-compact: дедлайн %s устарел, ожидание снято", sid)
                 continue
@@ -1131,11 +1802,481 @@ def _start_watchdog() -> None:
     logger.info("idle-compact: часовой запущен (проверка раз в 30 сек)")
 
 
+_STATUS_VERSION = "?"  # захватывается в register() из ctx.manifest.version
+
+
+def _pending_live(now: float | None = None) -> tuple[list, int]:
+    """Живые записи pending: pid владельца жив, дедлайн в будущем и сессия есть в БД.
+
+    Только чтение. Фантомы (мёртвый pid, просроченный дедлайн, мусор
+    ручных проб) в живые не попадают, но и не удаляются здесь.
+    Проверка сессии в БД нужна, т.к. pid на Windows переиспользуются:
+    мёртвый владелец + чужой свежий pid давали ложно-живые записи.
+    """
+    if now is None:
+        now = time.time()
+    try:
+        state = _load_pending()
+    except Exception:
+        return [], 0
+    live = []
+    for sid, entry in state.items():
+        try:
+            if not _pid_alive(int((entry or {}).get("pid") or 0)):
+                continue
+            if float((entry or {}).get("deadline") or 0) <= now:
+                continue
+            if _session_row(sid) is None:
+                continue
+            live.append(sid)
+        except Exception:
+            continue
+    return live, len(state)
+
+
+def _ledger_stats() -> dict | None:
+    """Агрегат леджера за всё время. Только чтение, O(размер файла).
+
+    В зачёт идут события с измеренным расходом (facts ненулевые) и записанным
+    ``baseline_usd``. Без расхода — «не в счёте» (экономия завышена на цену
+    сжатия); без базлайна — прежняя формула (до бэкфилла), только в debug.
+    Деньги знаковые: плюс — окупилось, минус — «зря».
+    """
+    try:
+        import json
+
+        from . import savings
+
+        path = savings.ledger_path()
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+    except Exception:
+        return None
+    plus_n = waste_n = unmeasured_n = legacy_n = n = 0
+    cold_n = warm_n = 0
+    plus = waste = base = 0.0
+    last_ts = 0.0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+        n += 1
+        try:
+            ts = float(event.get("ts") or 0)
+        except Exception:
+            ts = 0.0
+        if ts > last_ts:
+            last_ts = ts
+        if (event.get("verdict") or "") == "кеш был бы тёплым":
+            warm_n += 1
+        else:
+            cold_n += 1
+        try:
+            baseline = float(event.get("baseline_usd") or 0)
+        except Exception:
+            baseline = 0.0
+        if baseline <= 0:
+            legacy_n += 1
+            continue
+        facts = event.get("facts") or {}
+        try:
+            measured = (int(facts.get("input") or 0) > 0
+                        or int(facts.get("cache_read") or 0) > 0
+                        or int(facts.get("output") or 0) > 0)
+        except Exception:
+            measured = False
+        if not measured:
+            unmeasured_n += 1
+            continue
+        try:
+            amount = float(event.get("saved_usd") or 0)
+        except Exception:
+            amount = 0.0
+        base += baseline
+        if amount > 0:
+            plus_n += 1
+            plus += amount
+        elif amount < 0:
+            waste_n += 1
+            waste += amount
+    return {
+        "events": n, "plus_n": plus_n, "plus": plus,
+        "waste_n": waste_n, "waste": waste, "net": plus + waste,
+        "base": base, "unmeasured_n": unmeasured_n, "legacy_n": legacy_n,
+        "cold_n": cold_n, "warm_n": warm_n, "last_ts": last_ts,
+    }
+
+
+def _fmt_k(tokens: int) -> str:
+    """Токены коротко: 42245 → «~42K», 850 → «~850»."""
+    try:
+        tokens = int(tokens)
+    except Exception:
+        return "?"
+    if tokens < 1000:
+        return f"~{tokens}"
+    return f"~{round(tokens / 1000)}K"
+
+
+def _fmt_money(amount: float) -> str:
+    """Деньги в центах со знаком: +$0.13, -$0.06."""
+    try:
+        value = float(amount)
+        return f"{'+' if value >= 0 else '-'}${abs(value):.2f}"
+    except Exception:
+        return "?"
+
+
+def _breakdown_size(session_id: str | None) -> int | None:
+    """Точное число ядра (то же, что рисует его панель) или None.
+
+    Только для клика: на большой истории вызов дорогой (~0.5 с),
+    на каждый ход так нельзя — пуш идёт дешёвым usage.
+    """
+    if not session_id:
+        return None
+    try:
+        found = _resident(session_id)
+        if not found:
+            return None
+        from agent.context_breakdown import compute_session_context_breakdown
+
+        bd = compute_session_context_breakdown(found[0])
+        n = int((bd or {}).get("context_used") or 0)
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _rpc_status(params=None, session_id: str | None = None, _exact: bool = True, **kwargs):
+    """RPC ``plugin.idle-compact.status`` для десктопной половины.
+
+    Возвращает JSON. Цифры — ``savings``, ``chat`` и ``bar``: панель только
+    рисует, все проценты и пороги считает Python. ``chip`` и ``panel``
+    остаются коротким текстом для половины, которая ещё живёт в
+    неперезапущенном приложении.
+    Сессия — из params (активная вкладка) или из контекста вызова.
+    ``_exact`` — точное число ядра вместо usage (клик/переключение чата);
+    внутренний пуш зовёт с ``_exact=False`` (дешево, на каждый ход).
+    """
+    try:
+        params = params or {}
+        sid = params.get("session_id") or session_id
+        exact = _breakdown_size(sid) if _exact else None
+        size, gate = _panel_context(sid, exact=exact)
+        stats = _ledger_stats()
+        chat = _chat_state(sid, size, gate)
+        if size is not None and gate:
+            chip = "Ready" if size >= gate else f"{_fmt_k(gate - size)} left"
+        else:
+            chip = "idle-compact"
+        return {
+            "chip": chip,
+            "panel": _toast_panel(sid, size=size, gate=gate, stats=stats, chat=chat),
+            "bar": _bar_numbers(sid, size=size, gate=gate),
+            "savings": _savings_numbers(stats),
+            "chat": chat,
+            "version": _STATUS_VERSION,
+        }
+    except Exception as exc:
+        return {"chip": "idle-compact",
+                "panel": f"idle-compact: status failed ({exc})",
+                "version": _STATUS_VERSION}
+
+
+def _cmd_status(raw_args: str = "", session_id: str | None = None, _exact_size: int | None = None) -> str:
+    """Хендлер ``/idle-compact``: панель статуса. Строго read-only.
+
+    Порядок — от полезного к служебному: деньги → разбивка → контекст
+    и порог → наблюдение → диагностика (только ``/idle-compact debug``).
+    Нет данных — нет строки: «unknown» не показываем.
+    """
+    if str(raw_args or "").strip().lower() == "debug":
+        return _cmd_debug(session_id=session_id)
+    lines = [f"idle-compact {_STATUS_VERSION}"]
+    stats = _ledger_stats()
+    saved = _savings_numbers(stats)
+    if saved is None:
+        lines.append("compactions counted: 0")
+    else:
+        money = f"saved: {_fmt_money(saved['net'])}"
+        if saved["pct"] is not None:
+            money += f" — that's {saved['pct']}% of costs without the plugin"
+        lines.append(money)
+        brk = f"paid off {saved['paid']} · wasted {saved['wasted']}"
+        if saved["uncounted"] > 0:
+            brk += f" · {saved['uncounted']} more not counted (cost not saved)"
+        lines.append(brk)
+        if saved["last_ts"] > 0:
+            lines.append(f"last compaction: {_fmt_ts(saved['last_ts'])}")
+    size, gate = _panel_context(session_id, exact=_exact_size)
+    if size is not None:
+        src = "core count" if _exact_size else "provider usage"
+        ctx = f"current context: {_fmt_k(size)} ({src})"
+        if gate:
+            if size >= gate:
+                ctx += f" · over the limit ({_fmt_k(gate)})"
+            else:
+                ctx += f" · {_fmt_k(gate - size)} left before compaction (limit {_fmt_k(gate)})"
+        lines.append(ctx)
+    watch = _panel_watch(session_id)
+    if watch:
+        lines.append(watch)
+    if stats is not None and stats["waste_n"] > 0:
+        lines.append("“wasted” = did not pay off (usually: you came back before the cache died)")
+    return "\n".join(lines)
+
+
+def _fmt_ts(ts: float) -> str:
+    try:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(float(ts)).strftime("%d.%m %H:%M")
+    except Exception:
+        return "?"
+
+
+def _fmt_dur(seconds: float) -> str:
+    """Остаток таймера человеческим: ~8m / ~40s."""
+    try:
+        s = max(0, int(seconds))
+    except Exception:
+        return ""
+    if s >= 90:
+        return f"~{round(s / 60)}m"
+    return f"~{s}s"
+
+
+def _bar_numbers(session_id: str | None, exact: int | None = None,
+                 size: int | None = None, gate: int | None = None) -> dict | None:
+    """Цифры шкалы чипа: {used, idle_gate, threshold}. Нет данных — None.
+
+    Шкала — от 0 до порога ядра (не до окна: окно показывает сам Hermes).
+    JS только рисует, не считает. ``size``/``gate`` — уже посчитанные
+    вызывающим: один статус считает их один раз на всю отдачу.
+    """
+    if not session_id:
+        return None
+    try:
+        if size is None or gate is None:
+            size, gate = _panel_context(session_id, exact=exact)
+        if size is None or not gate:
+            return None
+        cfg = _read_config()
+        model = ""
+        try:
+            row = _session_row(session_id)
+            model = (row or {}).get("model") or ""
+        except Exception:
+            model = ""
+        window = _cached_window(model) if model else 0
+        thr = _live_threshold(window, cfg) if window > 0 else None
+        if not thr:
+            return None
+        return {"used": int(size), "idle_gate": int(gate), "threshold": int(thr)}
+    except Exception:
+        return None
+
+
+def _savings_numbers(stats: dict | None) -> dict | None:
+    """Деньги сэкономленного цифрами, для чипа и панели. Нет событий — None.
+
+    ``pct`` — доля сэкономленного от того, что эти сжатия стоили бы без
+    плагина; None, когда базлайна нет (считать процент не из чего).
+    Формула здесь одна: и ``/idle-compact``, и панель берут её отсюда.
+    """
+    if not stats or stats.get("events", 0) <= 0:
+        return None
+    pct = None
+    try:
+        if stats["base"] > 0:
+            pct = int(round(100 * stats["net"] / stats["base"]))
+    except Exception:
+        pct = None
+    try:
+        return {
+            "pct": pct,
+            "net": round(float(stats["net"]), 5),
+            "base": round(float(stats["base"]), 5),
+            "paid": int(stats["plus_n"]),
+            "wasted": int(stats["waste_n"]),
+            "uncounted": int(stats["unmeasured_n"]),
+            "events": int(stats["events"]),
+            "last_ts": float(stats["last_ts"]),
+        }
+    except Exception:
+        return None
+
+
+def _chat_state(session_id: str | None, size: int | None, gate: int | None) -> dict:
+    """Состояние этой сессии для панели: ``key`` для тона, ``label``, ``eta_s``.
+
+    Подпись — одна короткая строка без служебных слов: панель ставит её
+    значением строки «This chat».
+    """
+    if _core_record(session_id or "") is not None:
+        return {"key": "core", "label": "Core owns it — standing by", "eta_s": 0}
+    if size is None or not gate:
+        return {"key": "unknown", "label": "No measurements yet", "eta_s": 0}
+    if size < gate:
+        return {"key": "below_gate", "label": "Below gate — won't touch", "eta_s": 0}
+    left = 0
+    try:
+        entry = (_load_pending() or {}).get(session_id or "") or {}
+        left = int(float(entry.get("deadline") or 0) - time.time())
+    except Exception:
+        left = 0
+    if left > 0:
+        return {"key": "ready", "label": f"Will compact after {_fmt_dur(left)} idle",
+                "eta_s": left}
+    return {"key": "ready", "label": "Will compact while idle", "eta_s": 0}
+
+
+def _toast_panel(session_id: str | None, exact: int | None = None,
+                 size: int | None = None, gate: int | None = None,
+                 stats: dict | None = None, chat: dict | None = None) -> str:
+    """Короткая панель тоста: состояние + деньги. Детали — в /idle-compact.
+
+    Контекст в цифрах не показываем: его показывает сам Hermes.
+    ``size``/``gate``/``stats``/``chat`` — уже посчитанные вызывающим, чтобы
+    один статус не читал конфиг, базу и леджер по два раза.
+    """
+    try:
+        if chat is None:
+            if size is None or gate is None:
+                size, gate = _panel_context(session_id, exact=exact)
+            chat = _chat_state(session_id, size, gate)
+        state = str((chat or {}).get("label") or "No measurements yet")
+        saved = _savings_numbers(stats if stats is not None else _ledger_stats())
+        money = ""
+        if saved is not None:
+            money = f"saved: {_fmt_money(saved['net'])}"
+            if saved["pct"] is not None:
+                money += f" — that's {saved['pct']}%"
+            money += f" · paid {saved['paid']} · wasted {saved['wasted']}"
+            if saved["uncounted"] > 0:
+                money += f" · {saved['uncounted']} uncounted"
+        return state if not money else f"{state}\n{money}"
+    except Exception as exc:
+        return f"idle-compact: status failed ({exc})"
+
+
+def _panel_context(session_id: str | None, exact: int | None = None) -> tuple[int | None, int | None]:
+    """(текущий размер, порог в токенах) для панели. Нет данных — None.
+
+    Размер — только замер usage API из кеша. Оценка по символам занижает
+    в 2–3 раза и врёт сторону порога, поэтому фолбэка на неё нет: нет
+    замера — нет строки. ``exact`` — точное число ядра (клик по чипу).
+    """
+    if not session_id:
+        return None, None
+    size = exact if exact else _cached_usage(session_id)
+    if size <= 0:
+        return None, None
+    gate = None
+    try:
+        from types import SimpleNamespace
+
+        cfg = _read_config()
+        model = ""
+        try:
+            row = _session_row(session_id)
+            model = (row or {}).get("model") or ""
+        except Exception:
+            model = ""
+        window = _cached_window(model) if model else 0
+        comp = SimpleNamespace(context_length=window)
+        gate = _live_gate(comp, session_id, cfg)
+    except Exception:
+        gate = None
+    return size, gate
+
+
+def _panel_watch(session_id: str | None) -> str:
+    """Строка наблюдения: для своей сессии — персонально, иначе — счётчик."""
+    try:
+        live, _total = _pending_live()
+    except Exception:
+        return ""
+    if session_id:
+        if session_id in live:
+            return "this chat: will compact while idle"
+        return "this chat: will not compact while idle"
+    if live:
+        return f"waiting for idle: {len(live)}"
+    return ""
+
+
+def _cmd_debug(session_id: str | None = None) -> str:
+    """``/idle-compact debug``: внутренности для разбора полётов."""
+    lines = [f"idle-compact {_STATUS_VERSION} · debug"]
+    try:
+        engine = "on" if _WARM_ENGINE is not None else "off"
+    except Exception:
+        engine = "?"
+    try:
+        with _timers_lock:
+            timers = len(_timers)
+    except Exception:
+        timers = "?"
+    lines.append(f"warm compaction: {engine} · process timers: {timers} (pid {os.getpid()})")
+    try:
+        cfg = _read_config()
+        frac = _gate_fraction(session_id, cfg)
+    except Exception:
+        frac, cfg = 0.0, None
+    model, window = "", 0
+    if session_id:
+        try:
+            row = _session_row(session_id)
+            model = (row or {}).get("model") or ""
+        except Exception:
+            model = ""
+        if model:
+            window = _cached_window(model)
+    _size, gate = _panel_context(session_id)
+    lines.append(
+        f"gate: share {frac:g} · window {model or '?'}={window or '?'} (cache) · "
+        f"tokens {gate if gate else '?'}"
+    )
+    stats = _ledger_stats()
+    if stats is None:
+        lines.append("ledger: unreadable")
+    else:
+        lines.append(
+            f"verdicts: cold {stats['cold_n']} · warm {stats['warm_n']}"
+        )
+        lines.append(
+            f"exact money: +${stats['plus']:.5f} ${stats['waste']:.5f} = "
+            f"${stats['net']:+.5f} · baseline ${stats['base']:.5f}"
+        )
+        if stats["unmeasured_n"] > 0 or stats["legacy_n"] > 0:
+            lines.append(
+                f"out of count: no cost {stats['unmeasured_n']} · "
+                f"old formula {stats['legacy_n']}"
+            )
+    return "\n".join(lines)
+
+
+def _plugin_version() -> str:
+    """Версия из plugin.yaml — единственное место, где она задана."""
+    try:
+        data = _read_yaml_file(Path(__file__).with_name("plugin.yaml")) or {}
+        return str(data.get("version") or "?")
+    except Exception:
+        return "?"
+
+
 def register(ctx) -> None:
     """Точка входа плагина: движок, хук конца хода и хук захвата запроса."""
     # Свой контекст-движок: штатный компрессор + warm-путь суммирования.
     # Если не удастся зарегистрировать — плагин продолжит работать как раньше (aux-путь).
-    global _WARM_ENGINE
+    global _WARM_ENGINE, _STATUS_VERSION
     try:
         from .warm_engine import IdleWarmCompressor, signature_ok
 
@@ -1148,10 +2289,7 @@ def register(ctx) -> None:
             # поэтому дефолты конструктора (0.5/0.2) остались бы навсегда.
             eng_kwargs: dict = {"model": ""}
             try:
-                import yaml
-
-                with open(str(_home() / "config.yaml"), "r", encoding="utf-8") as fh:
-                    _comp = (yaml.safe_load(fh) or {}).get("compression") or {}
+                _comp = (_read_config() or {}).get("compression") or {}
                 if _comp.get("target_ratio") is not None:
                     eng_kwargs["summary_target_ratio"] = float(_comp["target_ratio"])
                 if _comp.get("threshold") is not None and _comp.get("threshold_tokens") is None:
@@ -1185,15 +2323,40 @@ def register(ctx) -> None:
 
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("post_api_request", _on_post_api)
+    ctx.register_hook("post_compaction", _on_post_compaction)
     try:
         from . import savings
         ctx.register_hook("post_api_request", savings.on_post_api_request)
     except Exception:
         logger.exception("idle-compact: savings hooks not registered")
+    try:
+        _STATUS_VERSION = str(getattr(getattr(ctx, "manifest", None), "version", "?") or "?")
+        reg_cmd = getattr(ctx, "register_command", None)
+        if callable(reg_cmd):
+            reg_cmd("idle-compact", _cmd_status,
+                    description="idle-compact: plugin status (read-only)")
+    except Exception:
+        logger.debug("idle-compact: command registration skipped", exc_info=True)
+    try:
+        reg_rpc = getattr(ctx, "register_rpc", None)
+        if callable(reg_rpc):
+            reg_rpc("status", _rpc_status)
+    except Exception:
+        logger.debug("idle-compact: rpc registration skipped", exc_info=True)
     logger.info(
-        "idle-compact 0.9.12 loaded: DRY_RUN=%s WRITE_ENABLED=%s gate=live-per-fire",
-        DRY_RUN, WRITE_ENABLED,
+        "idle-compact %s loaded: DRY_RUN=%s WRITE_ENABLED=%s gate=live-per-fire",
+        _plugin_version(), DRY_RUN, WRITE_ENABLED,
     )
+    try:
+        _eng = (((_read_config() or {}).get("context") or {}).get("engine", ""))
+        if str(_eng or "").strip().lower() not in ("idle_warm", "idle-warm"):
+            logger.warning(
+                "idle-compact: context.engine=%r — фон жмёт холодным aux без кеша; "
+                "для тёплых саммари: hermes config set context.engine idle_warm",
+                _eng or "compressor",
+            )
+    except Exception:
+        pass
     try:
         _boot_async()
     except Exception:

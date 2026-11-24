@@ -10,6 +10,8 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_DIR))
 
+from _bootstrap import AGENT_HOME  # noqa: E402,F401  (кладёт исходники ядра в sys.path)
+
 _spec = importlib.util.spec_from_file_location("wc_under_test", PLUGIN_DIR / "warm_client.py")
 assert _spec is not None and _spec.loader is not None
 wc = importlib.util.module_from_spec(_spec)
@@ -112,17 +114,17 @@ class TestApplyWarm(unittest.TestCase):
     def test_no_capture(self):
         with self.assertRaises(wc.WarmRefused):
             wc.apply_warm(captured={}, prompt="p", api_mode="chat_completions",
-                          base_url="https://x", api_key="k")
+                          base_url="https://x", api_key="k", timeout=5.0)
 
     def test_unsupported_mode(self):
         with self.assertRaises(wc.WarmRefused):
             wc.apply_warm(captured={"messages": [{"role": "user", "content": "x"}]},
-                          prompt="p", api_mode="weird", base_url="https://x", api_key="k")
+                          prompt="p", api_mode="weird", base_url="https://x", api_key="k", timeout=5.0)
 
     def test_no_route(self):
         with self.assertRaises(wc.WarmRefused):
             wc.apply_warm(captured={"messages": [{"role": "user", "content": "x"}]},
-                          prompt="p", api_mode="chat_completions", base_url="", api_key="")
+                          prompt="p", api_mode="chat_completions", base_url="", api_key="", timeout=5.0)
 
 
 class TestAffinityHeader(unittest.TestCase):
@@ -141,7 +143,6 @@ class TestAffinityHeader(unittest.TestCase):
 
     def test_conversation_key_matches_session(self):
         """Ключ разговора совпадает с session_id (нормализация — тождество)."""
-        sys.path.insert(0, "/usr/local/lib/hermes-agent")
         key = wc._conversation_session_key(
             "opencode-go", "https://opencode.ai/zen/go/v1", "20261027_054524_0c574947")
         self.assertEqual(key, "20261027_054524_0c574947")
@@ -151,10 +152,154 @@ class TestAffinityHeader(unittest.TestCase):
         self.assertIsNone(key)
 
 
+class TestRedirectSafety(unittest.TestCase):
+    """Редирект не преследуем: ключ пользователя не должен уйти на чужой хост."""
+
+    class _Resp:
+        def __init__(self, status, headers=None, content=b"{}"):
+            self.status_code = status
+            self.headers = headers or {}
+            self.content = content
+            self.text = content.decode()
+
+    class _Client:
+        seen_kwargs = None
+
+        def __init__(self, **kwargs):
+            type(self).seen_kwargs = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, *a, **kw):
+            return TestRedirectSafety._Resp(302, {"location": "https://evil.example/x"})
+
+    def test_follow_redirects_disabled(self):
+        orig = wc.httpx.Client
+        wc.httpx.Client = self._Client
+        try:
+            with self.assertRaises(wc.WarmRefused) as ctx:
+                wc.request_summary(
+                    captured={"body": {"messages": [{"role": "user", "content": "hi"}]}},
+                    prompt="summarise", api_mode="anthropic_messages",
+                    base_url="https://api.anthropic.com", api_key="k", timeout=5.0,
+                )
+        finally:
+            wc.httpx.Client = orig
+        self.assertFalse(self._Client.seen_kwargs.get("follow_redirects"))
+        self.assertIn("redirect not followed", str(ctx.exception))
+
+
+class TestNoOutputCap(unittest.TestCase):
+    def test_chat_without_cap(self):
+        body = wc.build_payload({"messages": [{"role": "user", "content": "hi"}]},
+                                "сожми", "chat_completions", None)
+        self.assertNotIn("max_tokens", body)
+
+    def test_responses_without_cap(self):
+        body = wc.build_payload({"input": [{"role": "user", "content": "hi"}]},
+                                "сожми", "codex_responses", None)
+        self.assertNotIn("max_output_tokens", body)
+
+    def test_anthropic_without_cap_keeps_required_budget(self):
+        """Anthropic требует max_tokens: без него релей отвечает 400.
+
+        Раньше поле удалялось (body.pop) и весь warm-путь падал на этом
+        транспорте. Запасной бюджет — не меньше 1500: при меньшем reasoning
+        съедает его целиком и текста саммари не остаётся (AGENTS.md).
+        """
+        body = wc.build_payload({"messages": [{"role": "user", "content": "hi"}]},
+                                "сожми", "anthropic_messages", None)
+        self.assertEqual(body["max_tokens"], wc.ANTHROPIC_MIN_MAX_TOKENS)
+        self.assertGreaterEqual(body["max_tokens"], 1500)
+
+    def test_anthropic_fallback_replaces_capture_budget(self):
+        """Захваченный max_tokens основного чата не утекает и без бюджета."""
+        body = wc.build_payload({"messages": [{"role": "user", "content": "hi"}],
+                                 "max_tokens": 128}, "сожми", "anthropic_messages", None)
+        self.assertEqual(body["max_tokens"], wc.ANTHROPIC_MIN_MAX_TOKENS)
+
+    def test_explicit_cap_from_capture_dropped(self):
+        """Захват мог содержать max_tokens основного чата — он не должен утечь."""
+        body = wc.build_payload({"messages": [{"role": "user", "content": "hi"}],
+                                 "max_tokens": 128}, "сожми", "chat_completions", None)
+        self.assertNotIn("max_tokens", body)
+
+
+class TestTruncationGuard(unittest.TestCase):
+    def test_chat_length(self):
+        self.assertTrue(wc._truncated({"choices": [{"finish_reason": "length"}]}, "chat_completions"))
+
+    def test_chat_stop(self):
+        self.assertFalse(wc._truncated({"choices": [{"finish_reason": "stop"}]}, "chat_completions"))
+
+    def test_anthropic_max_tokens(self):
+        self.assertTrue(wc._truncated({"stop_reason": "max_tokens"}, "anthropic_messages"))
+
+    def test_anthropic_end_turn(self):
+        self.assertFalse(wc._truncated({"stop_reason": "end_turn"}, "anthropic_messages"))
+
+    def test_responses_incomplete(self):
+        data = {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
+        self.assertTrue(wc._truncated(data, "codex_responses"))
+
+    def test_responses_completed(self):
+        self.assertFalse(wc._truncated({"status": "completed"}, "codex_responses"))
+
+    def test_no_choices(self):
+        self.assertFalse(wc._truncated({}, "chat_completions"))
+
+
+class TestExtraContext(unittest.TestCase):
+    def _we(self):
+        spec = importlib.util.spec_from_file_location("we_extra", PLUGIN_DIR / "warm_engine.py")
+        we = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(we)
+        return we
+
+    def test_nothing_added(self):
+        we = self._we()
+        self.assertEqual(we._extra_context("обычный промпт ядра", None), "")
+
+    def test_previous_summary_from_arg(self):
+        we = self._we()
+        out = we._extra_context("x", "## Goal\nсделать")
+        self.assertIn("PREVIOUS SUMMARY:", out)
+        self.assertIn("сделать", out)
+        self.assertIn("PRESERVE", out)
+
+    def test_previous_summary_parsed_from_prompt(self):
+        we = self._we()
+        prompt = "text\n\nPREVIOUS SUMMARY:\nстарое саммари\n\nNEW TURNS TO INCORPORATE:\nновое"
+        out = we._extra_context(prompt, None)
+        self.assertIn("старое саммари", out)
+        self.assertNotIn("новое", out)
+
+    def test_previous_summary_truncated(self):
+        we = self._we()
+        out = we._extra_context("x", "a" * (we.PREV_SUMMARY_LIMIT + 500))
+        self.assertIn("[truncated]", out)
+        self.assertLess(len(out), we.PREV_SUMMARY_LIMIT + 2000)
+
+    def test_focus_topic(self):
+        we = self._we()
+        out = we._extra_context('x\n\nFOCUS TOPIC: "плагин idle"\nдальше', None)
+        self.assertIn('FOCUS TOPIC: "плагин idle"', out)
+        self.assertIn("PRIORITISE", out)
+
+    def test_focus_and_previous_together(self):
+        we = self._we()
+        out = we._extra_context('FOCUS TOPIC: "тема"', "прошлое")
+        self.assertIn("PREVIOUS SUMMARY:", out)
+        self.assertIn('FOCUS TOPIC: "тема"', out)
+
+
 class TestEngineSignature(unittest.TestCase):
     def test_signature_matches_kernel(self):
         """Если ядро сменит сигнатуру _call_summary_llm — warm должен отключиться, а не падать."""
-        sys.path.insert(0, "/usr/local/lib/hermes-agent")
         spec = importlib.util.spec_from_file_location("we_under_test", PLUGIN_DIR / "warm_engine.py")
         assert spec is not None and spec.loader is not None
         we = importlib.util.module_from_spec(spec)
