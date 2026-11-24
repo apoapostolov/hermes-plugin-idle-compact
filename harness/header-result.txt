@@ -1,0 +1,8 @@
+PASS  old panel carries the rate
+PASS  old panel carries the money line
+PASS  new panel carries the money line
+PASS  old: the money is a block under the headline row
+PASS  new: the money is a child of the headline row, pushed right
+PASS  new: the block under the row is gone
+PASS  new: the row keeps the baseline alignment
+PASS  version moved with the build
